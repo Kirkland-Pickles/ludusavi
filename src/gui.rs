@@ -13,6 +13,7 @@ mod icon;
 mod modal;
 mod notification;
 mod popup_menu;
+mod restore_search;
 mod screen;
 mod search;
 mod shortcuts;

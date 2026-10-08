@@ -152,6 +152,7 @@ impl Backup {
 pub struct Restore {
     pub log: GameList,
     pub duplicate_detector: DuplicateDetector,
+    pub folder_search: super::restore_search::Search,
 }
 
 impl Restore {

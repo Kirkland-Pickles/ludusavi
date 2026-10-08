@@ -1354,6 +1354,36 @@ impl Translator {
         }
     }
 
+    pub fn found_restore_folder(&self, path: &StrictPath) -> String {
+        let mut args = FluentArgs::new();
+        args.set(PATH, path.render());
+        translate_args("restore-folder-found", &args)
+    }
+
+    pub fn restore_folder_searching(&self) -> String {
+        translate("restore-folder-searching")
+    }
+
+    pub fn restore_folder_search_cancelled(&self) -> String {
+        translate("restore-folder-search-cancelled")
+    }
+
+    pub fn restore_folder_search_limited(&self) -> String {
+        translate("restore-folder-search-limited")
+    }
+
+    pub fn restore_folder_search_not_found(&self) -> String {
+        translate("restore-folder-search-not-found")
+    }
+
+    pub fn restore_folder_use(&self) -> String {
+        translate("restore-folder-use")
+    }
+
+    pub fn restore_folder_keep(&self) -> String {
+        translate("restore-folder-keep")
+    }
+
     pub fn confirm_restore(&self, source: &StrictPath, suggest: bool) -> String {
         let primary = translate("confirm-restore");
 

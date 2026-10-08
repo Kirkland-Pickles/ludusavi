@@ -297,3 +297,16 @@ custom-game-will-override = This custom game overrides a manifest entry
 custom-game-will-extend = This custom game extends a manifest entry
 
 operation-will-only-include-listed-games = This will only process the games that are currently listed
+
+restore-folder-found =
+    Found your backups!
+
+    { $path }
+
+    Use this as your Restore from folder?
+restore-folder-searching = Looking for your ludusavi-backup folder…
+restore-folder-search-cancelled = Folder search cancelled.
+restore-folder-search-limited = Couldn't finish searching. Choose your backup folder with the folder button.
+restore-folder-search-not-found = Couldn't find your backups. Choose your backup folder with the folder button.
+restore-folder-use = Use this folder
+restore-folder-keep = Keep current folder

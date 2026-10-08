@@ -429,6 +429,53 @@ impl App {
         open.map(|_| Message::Ignore)
     }
 
+    fn find_restore_folders(&mut self) -> Task<Message> {
+        if self.config.restore.path.exists() {
+            return Task::none();
+        }
+        let search = &mut self.restore_screen.folder_search;
+        if search.searching {
+            return Task::none();
+        }
+        let (generation, cancel) = search.start(self.config.restore.path.clone());
+        self.close_specific_modal_alt(modal::Kind::ConfirmRestore);
+        self.timed_notification = Some(
+            Notification::new(TRANSLATOR.restore_folder_searching())
+                .action(&TRANSLATOR.cancel_button(), Message::StopRestoreFolderSearch),
+        );
+        let mut preferred = Vec::new();
+        if let Ok(path) = self.config.backup.path.as_std_path_buf() {
+            preferred.push(path);
+        }
+        preferred.extend(
+            [dirs::home_dir(), dirs::document_dir(), dirs::download_dir()]
+                .into_iter()
+                .flatten(),
+        );
+        let (sender, receiver) = iced::futures::channel::mpsc::unbounded();
+        let failed = sender.clone();
+        Task::batch([
+            Task::run(receiver, move |event| Message::RestoreFolderSearch(generation, event)),
+            Task::perform(
+                async move {
+                    if tokio::task::spawn_blocking(move || {
+                        super::restore_search::find(cancel.clone(), preferred, |event| {
+                            if sender.unbounded_send(event).is_err() {
+                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        });
+                    })
+                    .await
+                    .is_err()
+                    {
+                        let _ = failed.unbounded_send(super::restore_search::Event::Finished { limited: true });
+                    }
+                },
+                |_| Message::Ignore,
+            ),
+        ])
+    }
+
     fn save(&mut self) {
         self.save_pending(false);
     }
@@ -1135,6 +1182,9 @@ impl App {
 
                 let path = self.config.restore.path.clone();
                 if !path.is_dir() {
+                    if !path.exists() {
+                        return self.find_restore_folders();
+                    }
                     return self.show_modal(Modal::Error {
                         variant: Error::RestorationSourceInvalid { path },
                     });
@@ -1706,6 +1756,10 @@ impl App {
 
     fn switch_screen(&mut self, screen: Screen) -> Task<Message> {
         let leaving_restore = self.screen == Screen::Restore && screen != Screen::Restore;
+        if leaving_restore && self.restore_screen.folder_search.searching {
+            self.restore_screen.folder_search.stop();
+            self.timed_notification = None;
+        }
         self.screen = screen;
         if leaving_restore {
             self.save_pending(true);
@@ -1961,6 +2015,60 @@ impl App {
             Message::BackgroundTick => self.background_tick(),
             Message::BackgroundEdit(edit) => self.edit_background(edit),
             Message::OpenBackgroundSettings => self.open_background_settings(),
+            Message::UseRestoreFolder(path) => {
+                if !matches!(self.modals.last(), Some(Modal::FoundRestoreFolder { path: found }) if found == &path) {
+                    return Task::none();
+                }
+                if !path.is_dir() || BackupLayout::new(path.clone()).restorable_games().is_empty() {
+                    return self.show_error(Error::RestorationSourceInvalid { path });
+                }
+                let close = self.close_specific_modal(modal::Kind::FoundRestoreFolder);
+                let update = self.update(config::Event::RestoreSource(path.render()).into());
+                Task::batch([close, update])
+            }
+
+            Message::StopRestoreFolderSearch => {
+                self.restore_screen.folder_search.stop();
+                self.timed_notification =
+                    Some(Notification::new(TRANSLATOR.restore_folder_search_cancelled()).expires(3));
+                Task::none()
+            }
+            Message::RestoreFolderSearch(generation, event) => {
+                if !self
+                    .restore_screen
+                    .folder_search
+                    .accepts(generation, &self.config.restore.path)
+                {
+                    return Task::none();
+                }
+                if self.config.restore.path.exists() {
+                    self.restore_screen.folder_search.stop();
+                    self.timed_notification = None;
+                    return Task::none();
+                }
+                match event {
+                    super::restore_search::Event::Found(path) => {
+                        if !path.is_dir() {
+                            return Task::none();
+                        }
+                        self.restore_screen.folder_search.stop();
+                        self.timed_notification = None;
+                        self.show_modal(Modal::FoundRestoreFolder { path })
+                    }
+                    super::restore_search::Event::Finished { limited } => {
+                        self.restore_screen.folder_search.stop();
+                        self.timed_notification = Some(
+                            Notification::new(if limited {
+                                TRANSLATOR.restore_folder_search_limited()
+                            } else {
+                                TRANSLATOR.restore_folder_search_not_found()
+                            })
+                            .expires(8),
+                        );
+                        Task::none()
+                    }
+                }
+            }
             Message::BackgroundPolled(revision, result) => {
                 if revision != self.background_revision {
                     return Task::none();
@@ -2134,6 +2242,10 @@ impl App {
                         self.config.backup.path.reset(text);
                     }
                     config::Event::RestoreSource(text) => {
+                        if self.restore_screen.folder_search.searching {
+                            self.restore_screen.folder_search.stop();
+                            self.timed_notification = None;
+                        }
                         self.text_histories.restore_source.push(&text);
                         self.config.restore.path.reset(text);
                     }
@@ -3086,6 +3198,10 @@ impl App {
                 }
             }
             Message::UndoRedo(action, subject) => {
+                if subject == UndoSubject::RestoreSource && self.restore_screen.folder_search.searching {
+                    self.restore_screen.folder_search.stop();
+                    self.timed_notification = None;
+                }
                 let shortcut = Shortcut::from(action);
                 match subject {
                     UndoSubject::BackupTarget => shortcut.apply_to_strict_path_field(
@@ -3956,5 +4072,77 @@ mod tests {
         assert_eq!(app.window, Some(main));
         assert!(app.background_settings_window.is_none());
         assert!(!app.exiting);
+    }
+
+    #[test]
+    fn missing_restore_folder_search_offers_a_popup_and_fills_only_after_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let found = StrictPath::from(temp.path().join("ludusavi-backup"));
+        let mapping = found.joined("game/mapping.yaml");
+        mapping.create_parent_dir().unwrap();
+        mapping
+            .write_with_content(include_str!("../../tests/backup/game3-renamed/mapping.yaml"))
+            .unwrap();
+        let mut app = App::default();
+        let missing = StrictPath::from(temp.path().join("missing"));
+        let _ = app.update(config::Event::RestoreSource(missing.render()).into());
+        assert!(
+            !app.restore_screen.folder_search.searching,
+            "typing must not trigger search"
+        );
+        let backup_target = app.config.backup.path.clone();
+        let _ = app.handle_restore(RestorePhase::Start {
+            preview: true,
+            games: None,
+        });
+        assert!(app.restore_screen.folder_search.searching);
+        assert!(app.modals.is_empty(), "search replaces the missing-folder error");
+        let generation = app.restore_screen.folder_search.generation;
+        let _ = app.update(Message::RestoreFolderSearch(
+            generation,
+            super::super::restore_search::Event::Found(found.clone()),
+        ));
+        assert_eq!(app.config.restore.path.render(), missing.render());
+        assert!(matches!(app.modals.last(), Some(Modal::FoundRestoreFolder { .. })));
+        let _ = app.update(Message::UseRestoreFolder(found.clone()));
+        assert_eq!(app.config.restore.path.render(), found.render());
+        assert_eq!(app.config.backup.path, backup_target);
+        assert!(app.pending_save.contains_key(&SaveKind::Config));
+        assert!(!app.restore_screen.folder_search.searching);
+        assert!(app.modals.is_empty());
+        assert!(app.operation.idle(), "finding the folder must not restore saves");
+    }
+
+    #[test]
+    fn edited_restore_path_cancels_search_and_cannot_be_overwritten_by_old_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::default();
+        app.config.restore.path = StrictPath::from(temp.path().join("missing"));
+        let _ = app.handle_restore(RestorePhase::Start {
+            preview: true,
+            games: None,
+        });
+        let generation = app.restore_screen.folder_search.generation;
+        let changed = StrictPath::from(temp.path().join("chosen"));
+        let _ = app.update(config::Event::RestoreSource(changed.render()).into());
+        assert!(!app.restore_screen.folder_search.searching);
+        let _ = app.update(Message::RestoreFolderSearch(
+            generation,
+            super::super::restore_search::Event::Found(StrictPath::from(temp.path().to_path_buf())),
+        ));
+        assert_eq!(app.config.restore.path.render(), changed.render());
+        assert!(app.timed_notification.is_none());
+    }
+    #[test]
+    fn declining_found_restore_folder_keeps_current_path() {
+        let mut app = App::default();
+        let original = app.config.restore.path.clone();
+        app.modals.push(Modal::FoundRestoreFolder {
+            path: StrictPath::new("C:/found/ludusavi-backup"),
+        });
+        let _ = app.update(Message::CloseModal);
+        assert_eq!(app.config.restore.path, original);
+        assert!(app.pending_save.is_empty());
+        assert!(app.modals.is_empty());
     }
 }

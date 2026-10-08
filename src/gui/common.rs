@@ -118,6 +118,9 @@ pub enum Message {
     ),
     BackgroundEdit(super::background::Edit),
     OpenBackgroundSettings,
+    UseRestoreFolder(StrictPath),
+    StopRestoreFolderSearch,
+    RestoreFolderSearch(u64, super::restore_search::Event),
     Exit {
         user: bool,
     },

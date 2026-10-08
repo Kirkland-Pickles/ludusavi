@@ -15,7 +15,7 @@ use crate::{
         icon::Icon,
         shortcuts::TextHistories,
         style,
-        widget::{Column, Container, Element, IcedParentExt, Row, Space, pick_list, text},
+        widget::{Button, Column, Container, Element, IcedParentExt, Row, Space, pick_list, text},
     },
     lang::TRANSLATOR,
     prelude::{Error, Finality, SyncDirection},
@@ -122,6 +122,7 @@ pub enum Kind {
     Exiting,
     ConfirmBackup,
     ConfirmRestore,
+    FoundRestoreFolder,
     NoMissingRoots,
     ConfirmAddMissingRoots,
     BackupValidation,
@@ -149,6 +150,9 @@ pub enum Modal {
     },
     ConfirmRestore {
         games: Option<GameSelection>,
+    },
+    FoundRestoreFolder {
+        path: crate::prelude::StrictPath,
     },
     NoMissingRoots,
     ConfirmAddMissingRoots(Vec<Root>),
@@ -188,6 +192,7 @@ impl Modal {
             Modal::Exiting => Kind::Exiting,
             Modal::ConfirmBackup { .. } => Kind::ConfirmBackup,
             Modal::ConfirmRestore { .. } => Kind::ConfirmRestore,
+            Modal::FoundRestoreFolder { .. } => Kind::FoundRestoreFolder,
             Modal::NoMissingRoots => Kind::NoMissingRoots,
             Modal::ConfirmAddMissingRoots(..) => Kind::ConfirmAddMissingRoots,
             Modal::BackupValidation { .. } => Kind::BackupValidation,
@@ -210,6 +215,7 @@ impl Modal {
             Modal::Exiting => false,
             Modal::ConfirmBackup { .. } => false,
             Modal::ConfirmRestore { .. } => false,
+            Modal::FoundRestoreFolder { .. } => false,
             Modal::NoMissingRoots => false,
             Modal::ConfirmAddMissingRoots(..) => false,
             Modal::BackupValidation { .. } => false,
@@ -234,6 +240,7 @@ impl Modal {
             | Self::ActiveScanGames => ModalVariant::Info,
             Self::ConfirmBackup { .. }
             | Self::ConfirmRestore { .. }
+            | Self::FoundRestoreFolder { .. }
             | Self::ConfirmAddMissingRoots(..)
             | Self::ConfigureFtpRemote { .. }
             | Self::ConfigureSmbRemote { .. }
@@ -265,6 +272,7 @@ impl Modal {
                 TRANSLATOR.confirm_backup(&config.backup.path, config.backup.path.exists(), true)
             }
             Self::ConfirmRestore { .. } => TRANSLATOR.confirm_restore(&config.restore.path, true),
+            Self::FoundRestoreFolder { path } => TRANSLATOR.found_restore_folder(path),
             Self::NoMissingRoots => TRANSLATOR.no_missing_roots(),
             Self::ConfirmAddMissingRoots(missing) => TRANSLATOR.confirm_add_missing_roots(missing),
             Self::AppUpdate { release } => TRANSLATOR.new_version_available(release.version.to_string().as_str()),
@@ -319,6 +327,7 @@ impl Modal {
                 preview: false,
                 games: games.clone(),
             })),
+            Self::FoundRestoreFolder { path } => Some(Message::UseRestoreFolder(path.clone())),
             Self::ConfirmAddMissingRoots(missing) => Some(Message::ConfirmAddMissingRoots(missing.clone())),
             Self::AppUpdate { release } => Some(Message::OpenUrlAndCloseModal(release.url.clone())),
             Self::UpdatingManifest => None,
@@ -425,6 +434,7 @@ impl Modal {
             | Self::Exiting
             | Self::ConfirmBackup { .. }
             | Self::ConfirmRestore { .. }
+            | Self::FoundRestoreFolder { .. }
             | Self::NoMissingRoots
             | Self::ConfirmAddMissingRoots(_)
             | Self::UpdatingManifest
@@ -451,6 +461,7 @@ impl Modal {
             | Self::Exiting
             | Self::ConfirmBackup { .. }
             | Self::ConfirmRestore { .. }
+            | Self::FoundRestoreFolder { .. }
             | Self::NoMissingRoots
             | Self::ConfirmAddMissingRoots(_)
             | Self::AppUpdate { .. }
@@ -616,6 +627,7 @@ impl Modal {
             | Self::Exiting
             | Self::ConfirmBackup { .. }
             | Self::ConfirmRestore { .. }
+            | Self::FoundRestoreFolder { .. }
             | Self::NoMissingRoots
             | Self::ConfirmAddMissingRoots(_)
             | Self::BackupValidation { .. }
@@ -655,6 +667,7 @@ impl Modal {
             | Self::Exiting
             | Self::ConfirmBackup { .. }
             | Self::ConfirmRestore { .. }
+            | Self::FoundRestoreFolder { .. }
             | Self::NoMissingRoots
             | Self::ConfirmAddMissingRoots(_)
             | Self::BackupValidation { .. }
@@ -678,6 +691,7 @@ impl Modal {
             | Self::Exiting
             | Self::ConfirmBackup { .. }
             | Self::ConfirmRestore { .. }
+            | Self::FoundRestoreFolder { .. }
             | Self::NoMissingRoots
             | Self::ConfirmAddMissingRoots(_)
             | Self::BackupValidation { .. }
@@ -699,6 +713,7 @@ impl Modal {
             | Self::Exiting
             | Self::ConfirmBackup { .. }
             | Self::ConfirmRestore { .. }
+            | Self::FoundRestoreFolder { .. }
             | Self::NoMissingRoots
             | Self::ConfirmAddMissingRoots(_)
             | Self::BackupValidation { .. }
@@ -720,6 +735,7 @@ impl Modal {
             | Self::Exiting
             | Self::ConfirmBackup { .. }
             | Self::ConfirmRestore { .. }
+            | Self::FoundRestoreFolder { .. }
             | Self::NoMissingRoots
             | Self::ConfirmAddMissingRoots(_)
             | Self::BackupValidation { .. }
@@ -734,6 +750,50 @@ impl Modal {
     }
 
     pub fn view(&self, config: &Config, histories: &TextHistories, operation: &Operation) -> Element {
+        if let Self::FoundRestoreFolder { .. } = self {
+            let choice = |label: String, action, class| {
+                Button::new(
+                    text(label)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center),
+                )
+                .width(180)
+                .height(36)
+                .padding(5)
+                .class(class)
+                .on_press_maybe(action)
+            };
+            let popup = Container::new(
+                Column::new().spacing(20).push(text(self.text(config))).push(
+                    Row::new()
+                        .spacing(15)
+                        .push(choice(
+                            TRANSLATOR.restore_folder_use(),
+                            self.message(histories),
+                            style::Button::Primary,
+                        ))
+                        .push(choice(
+                            TRANSLATOR.restore_folder_keep(),
+                            Some(Message::CloseModal),
+                            style::Button::Negative,
+                        )),
+                ),
+            )
+            .padding(20)
+            .width(550)
+            .class(style::Container::ModalForeground);
+            return opaque(
+                mouse_area(
+                    Container::new(opaque(popup))
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
+                        .class(style::Container::ModalBackground),
+                )
+                .on_press(Message::CloseModal),
+            );
+        }
         let horizontal = || {
             Container::new(Space::new().width(Length::FillPortion(1)).height(Length::Fill))
                 .class(style::Container::ModalBackground)
