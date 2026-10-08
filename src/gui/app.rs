@@ -6,7 +6,7 @@ use std::{
 use iced::{Alignment, Length, Subscription, Task, keyboard, widget::scrollable};
 
 use crate::{
-    cloud::{Rclone, Remote, rclone_monitor},
+    cloud::{MetadataEdit, Rclone, Remote, rclone_monitor},
     gui::{
         button,
         common::{
@@ -114,6 +114,10 @@ pub struct App {
     rclone_monitor_sender: Option<iced::futures::channel::mpsc::Sender<rclone_monitor::Input>>,
     exiting: bool,
     pending_save: HashMap<SaveKind, Instant>,
+    edited_metadata: HashMap<String, MetadataEdit>,
+    metadata_sync_requested: bool,
+    metadata_sync_active: bool,
+    after_metadata_sync: Option<BackupPhase>,
     modifiers: keyboard::Modifiers,
     jump_to_game_after_scan: Option<String>,
 }
@@ -121,7 +125,7 @@ pub struct App {
 impl App {
     fn go_idle(&mut self) {
         if self.exiting {
-            self.save();
+            self.save_pending(true);
             std::process::exit(0);
         }
 
@@ -182,11 +186,15 @@ impl App {
     }
 
     fn save(&mut self) {
+        self.save_pending(false);
+    }
+
+    fn save_pending(&mut self, force: bool) {
         let threshold = Duration::from_secs(1);
         let now = Instant::now();
 
         self.pending_save.retain(|item, then| {
-            if (now - *then) < threshold {
+            if !force && (now - *then) < threshold {
                 return true;
             }
 
@@ -211,6 +219,77 @@ impl App {
     fn save_backup(&mut self, game: &str) {
         self.pending_save
             .insert(SaveKind::Backup(game.to_string()), Instant::now());
+    }
+
+    fn save_edited_backup(&mut self, game: &str, before: Option<(StrictPath, String)>) {
+        self.save_backup(game);
+        if self.config.cloud.synchronize
+            && let Some((file, before)) = before
+        {
+            self.edited_metadata.entry(game.to_string()).or_insert_with(|| {
+                let before = file.try_read().unwrap_or(before);
+                MetadataEdit {
+                    file,
+                    before,
+                    after: String::new(),
+                }
+            });
+        }
+    }
+
+    fn sync_edited_metadata(&mut self) -> Task<Message> {
+        if !self.operation.idle() {
+            self.metadata_sync_requested = true;
+            return Task::none();
+        }
+        self.metadata_sync_requested = false;
+        self.save_pending(true);
+        if !self.config.cloud.synchronize {
+            self.edited_metadata.clear();
+        }
+        if self.edited_metadata.is_empty() {
+            return Task::none();
+        }
+        let remote = match crate::cloud::validate_cloud_config(&self.config, &self.config.cloud.path) {
+            Ok(remote) => remote,
+            Err(error) => {
+                return self.finish_metadata_sync(Some(error));
+            }
+        };
+        let mut edits = Vec::new();
+        for (game, edit) in &mut self.edited_metadata {
+            let Some((file, after)) = self.restore_screen.log.mapping(game) else {
+                return self.finish_metadata_sync(Some(Error::SomeEntriesFailed));
+            };
+            if file != edit.file {
+                return self.finish_metadata_sync(Some(Error::CloudConflict));
+            }
+            edit.after = after;
+            edits.push((game.clone(), edit.clone()));
+        }
+        let rclone = Rclone::new(self.config.apps.rclone.clone(), remote);
+        let root = self.config.restore.path.clone();
+        let remote_path = self.config.cloud.path.clone();
+        self.operation = Operation::new_cloud(SyncDirection::Upload, Finality::Final);
+        self.metadata_sync_active = true;
+        let cancel = self.operation_should_cancel.clone();
+        self.progress.start();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    edits
+                        .into_iter()
+                        .map(|(game, edit)| {
+                            let result = rclone.upload_metadata(&root, &remote_path, &edit, &cancel);
+                            (game, result)
+                        })
+                        .collect()
+                })
+                .await
+                .unwrap_or_else(|_| vec![(String::new(), Err(Error::SomeEntriesFailed))])
+            },
+            Message::EditedMetadataSynced,
+        )
     }
 
     fn invalidate_path_caches(&self) {
@@ -293,6 +372,99 @@ impl App {
         Ok(())
     }
 
+    fn finish_metadata_sync(&mut self, error: Option<Error>) -> Task<Message> {
+        self.metadata_sync_active = false;
+        if self.operation_should_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            self.after_metadata_sync = None;
+            self.metadata_sync_requested = false;
+            self.go_idle();
+            return Task::none();
+        }
+        if error.is_some() {
+            self.exiting = false;
+        }
+        self.save_pending(true);
+        self.go_idle();
+        if error.is_none()
+            && self.after_metadata_sync.is_some()
+            && self.metadata_sync_requested
+            && !self.edited_metadata.is_empty()
+        {
+            return self.sync_edited_metadata();
+        }
+        if let Some(BackupPhase::Start {
+            preview,
+            repair,
+            jump,
+            games,
+        }) = self.after_metadata_sync.take()
+        {
+            self.start_backup(preview, repair, jump, games, error)
+        } else if let Some(error) = error {
+            self.show_error(error)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn start_backup(
+        &mut self,
+        preview: bool,
+        repair: bool,
+        jump: bool,
+        mut games: Option<GameSelection>,
+        metadata_error: Option<Error>,
+    ) -> Task<Message> {
+        const SCAN_KIND: ScanKind = ScanKind::Backup;
+        let mut cleared_log = false;
+        if games.is_none() {
+            if self.backup_screen.log.is_filtered() {
+                games = Some(GameSelection::group(self.backup_screen.log.visible_games(
+                    SCAN_KIND,
+                    &self.config,
+                    &self.manifest.extended,
+                    &self.backup_screen.duplicate_detector,
+                )));
+            } else {
+                self.backup_screen.log.clear();
+                self.backup_screen.duplicate_detector.clear();
+                self.reset_scroll_position(ScrollSubject::Backup);
+                cleared_log = true;
+            }
+        }
+
+        if jump && let Some(GameSelection::Single { game }) = &games {
+            self.jump_to_game_after_scan = Some(game.clone());
+        }
+
+        self.operation = Operation::new_backup(if preview { Finality::Preview } else { Finality::Final }, games);
+        self.operation.set_force_new_full_backups(repair);
+        let skip_cloud = metadata_error.is_some();
+        if let Some(error) = metadata_error {
+            self.operation.push_error(error);
+        }
+
+        if !preview && let Err(e) = prepare_backup_target(&self.config.backup.path) {
+            self.go_idle();
+            return self.show_error(e);
+        }
+
+        Task::batch([
+            self.close_modal(),
+            if repair {
+                self.switch_screen(Screen::Backup)
+            } else {
+                Task::none()
+            },
+            self.refresh_scroll_position_on_log(cleared_log),
+            self.handle_backup(if skip_cloud {
+                BackupPhase::Load
+            } else {
+                BackupPhase::CloudCheck
+            }),
+        ])
+    }
+
     fn handle_backup(&mut self, phase: BackupPhase) -> Task<Message> {
         const SCAN_KIND: ScanKind = ScanKind::Backup;
 
@@ -302,52 +474,23 @@ impl App {
                 preview,
                 repair,
                 jump,
-                mut games,
+                games,
             } => {
                 if !self.operation.idle() {
                     return Task::none();
                 }
 
-                let mut cleared_log = false;
-                if games.is_none() {
-                    if self.backup_screen.log.is_filtered() {
-                        games = Some(GameSelection::group(self.backup_screen.log.visible_games(
-                            SCAN_KIND,
-                            &self.config,
-                            &self.manifest.extended,
-                            &self.backup_screen.duplicate_detector,
-                        )));
-                    } else {
-                        self.backup_screen.log.clear();
-                        self.backup_screen.duplicate_detector.clear();
-                        self.reset_scroll_position(ScrollSubject::Backup);
-                        cleared_log = true;
-                    }
+                if !preview && !self.edited_metadata.is_empty() && self.config.cloud.synchronize {
+                    self.after_metadata_sync = Some(BackupPhase::Start {
+                        preview,
+                        repair,
+                        jump,
+                        games,
+                    });
+                    return self.sync_edited_metadata();
                 }
 
-                if jump && let Some(GameSelection::Single { game }) = &games {
-                    self.jump_to_game_after_scan = Some(game.clone());
-                }
-
-                self.operation =
-                    Operation::new_backup(if preview { Finality::Preview } else { Finality::Final }, games);
-                self.operation.set_force_new_full_backups(repair);
-
-                if !preview && let Err(e) = prepare_backup_target(&self.config.backup.path) {
-                    self.go_idle();
-                    return self.show_error(e);
-                }
-
-                Task::batch([
-                    self.close_modal(),
-                    if repair {
-                        self.switch_screen(Screen::Backup)
-                    } else {
-                        Task::none()
-                    },
-                    self.refresh_scroll_position_on_log(cleared_log),
-                    self.handle_backup(BackupPhase::CloudCheck),
-                ])
+                self.start_backup(preview, repair, jump, games, None)
             }
             BackupPhase::CloudCheck => {
                 if self.operation.preview()
@@ -1190,6 +1333,7 @@ impl App {
         self.operation_steps.clear();
         self.operation.flag_cancel();
         if self.operation.is_cloud_active()
+            && !self.metadata_sync_active
             && let Some(sender) = self.rclone_monitor_sender.as_mut()
         {
             let _ = sender.try_send(rclone_monitor::Input::Cancel);
@@ -1309,8 +1453,14 @@ impl App {
     }
 
     fn switch_screen(&mut self, screen: Screen) -> Task<Message> {
+        let leaving_restore = self.screen == Screen::Restore && screen != Screen::Restore;
         self.screen = screen;
-        self.refresh_scroll_position()
+        if leaving_restore {
+            self.save_pending(true);
+            Task::batch([self.refresh_scroll_position(), self.sync_edited_metadata()])
+        } else {
+            self.refresh_scroll_position()
+        }
     }
 
     fn scroll_subject(&self) -> ScrollSubject {
@@ -1494,7 +1644,11 @@ impl App {
             Message::CloseModal => self.close_modal(),
             Message::Exit { user } => {
                 if self.operation.idle() || (user && self.exiting) {
-                    self.save();
+                    if !self.exiting && !self.edited_metadata.is_empty() && self.config.cloud.synchronize {
+                        self.exiting = true;
+                        return self.sync_edited_metadata();
+                    }
+                    self.save_pending(true);
                     std::process::exit(0)
                 } else {
                     self.exiting = true;
@@ -1504,6 +1658,30 @@ impl App {
             Message::Save => {
                 self.save();
                 Task::none()
+            }
+            Message::SyncEditedMetadata => self.sync_edited_metadata(),
+            Message::EditedMetadataSynced(results) => {
+                let mut error = None;
+                for (game, result) in results {
+                    match result {
+                        Ok(()) => {
+                            if let Some(edit) = self.edited_metadata.get_mut(&game) {
+                                if self.restore_screen.log.mapping(&game).as_ref()
+                                    == Some(&(edit.file.clone(), edit.after.clone()))
+                                {
+                                    self.edited_metadata.remove(&game);
+                                } else {
+                                    edit.before.clone_from(&edit.after);
+                                    self.metadata_sync_requested = true;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                        }
+                    }
+                }
+                self.finish_metadata_sync(error)
             }
             Message::UpdateTime => {
                 self.progress.update_time();
@@ -2618,6 +2796,7 @@ impl App {
                         return Task::none();
                     }
                     UndoSubject::BackupComment(game) => {
+                        let before = self.restore_screen.log.mapping(&game);
                         if let Some(info) = self.text_histories.backup_comments.get_mut(&game) {
                             let comment = match shortcut {
                                 Shortcut::Undo => info.undo(),
@@ -2626,7 +2805,7 @@ impl App {
 
                             let updated = self.restore_screen.log.set_comment(&game, comment);
                             if updated {
-                                self.save_backup(&game);
+                                self.save_edited_backup(&game, before);
                             }
                         }
                     }
@@ -2682,9 +2861,10 @@ impl App {
                 GameAction::Wiki => Self::open_wiki(game),
                 GameAction::Comment => self.toggle_backup_comment_editor(game),
                 GameAction::Lock | GameAction::Unlock => {
+                    let before = self.restore_screen.log.mapping(&game);
                     let updated = self.restore_screen.log.toggle_locked(&game);
                     if updated {
-                        self.save_backup(&game);
+                        self.save_edited_backup(&game, before);
                     }
                     Task::none()
                 }
@@ -2699,8 +2879,9 @@ impl App {
                 iced::widget::operation::scroll_to(subject.id(), position)
             }
             Message::EditedBackupComment { game, action } => {
+                let before = self.restore_screen.log.mapping(&game);
                 if let Some(comment) = self.restore_screen.log.apply_comment_action(&game, action) {
-                    self.save_backup(&game);
+                    self.save_edited_backup(&game, before);
                     if let Some(info) = self.text_histories.backup_comments.get_mut(&game) {
                         info.push(&comment);
                     }
@@ -3010,6 +3191,10 @@ impl App {
             subscriptions.push(iced::time::every(Duration::from_millis(200)).map(|_| Message::Save));
         }
 
+        if self.metadata_sync_requested && self.operation.idle() {
+            subscriptions.push(iced::time::every(Duration::from_millis(200)).map(|_| Message::SyncEditedMetadata));
+        }
+
         if self.flags.update_manifest {
             subscriptions.push(
                 iced::time::every(Duration::from_secs(60 * 60 * 24)).map(|_| Message::UpdateManifest { force: false }),
@@ -3087,5 +3272,164 @@ impl App {
             .push(stack)
             .push_if(self.progress.visible(), || self.progress.view(&self.operation))
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        gui::game_list::GameListEntry,
+        scan::{ScanInfo, layout::GameLayout},
+    };
+
+    fn note_editor() -> (tempfile::TempDir, App, StrictPath) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = StrictPath::new(temp.path().to_string_lossy().into_owned());
+        let file = root.joined("game3/mapping.yaml");
+        file.create_parent_dir().unwrap();
+        file.write_with_content(include_str!("../../tests/backup/game3-renamed/mapping.yaml"))
+            .unwrap();
+        let layout = GameLayout::load(root.joined("game3")).unwrap();
+        let backup = layout.restorable_backups_flattened().pop().unwrap();
+        let mut app = App {
+            screen: Screen::Restore,
+            ..Default::default()
+        };
+        app.config.backup.path = root.clone();
+        app.config.restore.path = root;
+        app.restore_screen.log.entries.push(GameListEntry {
+            scan_info: ScanInfo {
+                game_name: "game3".into(),
+                backup: Some(backup),
+                ..Default::default()
+            },
+            game_layout: Some(layout),
+            comment_editor: Some(Default::default()),
+            ..Default::default()
+        });
+        (temp, app, file)
+    }
+
+    #[test]
+    fn leaving_restore_saves_note_before_debounce_expires() {
+        let (_temp, mut app, file) = note_editor();
+        let before = app.restore_screen.log.mapping("game3");
+        assert!(app.restore_screen.log.set_comment("game3", "keep this backup".into()));
+        app.save_edited_backup("game3", before);
+        assert!(!file.try_read().unwrap().contains("keep this backup"));
+        let _ = app.switch_screen(Screen::Backup);
+        assert!(file.try_read().unwrap().contains("keep this backup"));
+        assert!(app.pending_save.is_empty());
+    }
+
+    #[test]
+    fn unchanged_note_does_not_schedule_save() {
+        let (_temp, mut app, _file) = note_editor();
+        assert!(!app.restore_screen.log.set_comment("game3", String::new()));
+        assert!(app.pending_save.is_empty());
+    }
+
+    #[test]
+    fn multiple_edits_keep_original_cloud_baseline_and_failed_edits_can_retry() {
+        let (_temp, mut app, file) = note_editor();
+        app.config.cloud.synchronize = true;
+        let original = file.try_read().unwrap();
+        for note in ["first", "second"] {
+            let before = app.restore_screen.log.mapping("game3");
+            assert!(app.restore_screen.log.set_comment("game3", note.into()));
+            app.save_edited_backup("game3", before);
+        }
+        assert_eq!(app.edited_metadata["game3"].before, original);
+        let _ = app.update(Message::EditedMetadataSynced(vec![(
+            "game3".into(),
+            Err(Error::CloudConflict),
+        )]));
+        assert!(app.edited_metadata.contains_key("game3"));
+        app.edited_metadata.get_mut("game3").unwrap().after = app.restore_screen.log.mapping("game3").unwrap().1;
+        let _ = app.update(Message::EditedMetadataSynced(vec![("game3".into(), Ok(()))]));
+        assert!(app.edited_metadata.is_empty());
+    }
+
+    fn queued_note_backup(app: &mut App) {
+        app.after_metadata_sync = Some(BackupPhase::Start {
+            preview: false,
+            repair: false,
+            jump: false,
+            games: Some(GameSelection::Single { game: "game3".into() }),
+        });
+        app.operation = Operation::new_cloud(SyncDirection::Upload, Finality::Final);
+        app.metadata_sync_active = true;
+    }
+
+    #[test]
+    fn failed_note_upload_still_starts_local_backup_without_cloud_upload() {
+        for error in [Error::CloudConflict, Error::SomeEntriesFailed] {
+            let (_temp, mut app, _file) = note_editor();
+            app.config.cloud.synchronize = true;
+            let before = app.restore_screen.log.mapping("game3");
+            app.restore_screen.log.set_comment("game3", "pending".into());
+            app.save_edited_backup("game3", before);
+            queued_note_backup(&mut app);
+            let _ = app.update(Message::EditedMetadataSynced(vec![(
+                "game3".into(),
+                Err(error.clone()),
+            )]));
+            assert!(matches!(app.operation, Operation::Backup { .. }));
+            assert_eq!(app.operation.errors().unwrap(), &vec![error]);
+            assert!(!app.operation.integrated_checking_cloud());
+            assert!(!app.operation.should_sync_cloud_after());
+            assert!(app.edited_metadata.contains_key("game3"));
+        }
+    }
+
+    #[test]
+    fn unavailable_note_sync_does_not_prevent_a_local_backup() {
+        let (_temp, mut app, _file) = note_editor();
+        app.config.cloud.synchronize = true;
+        let before = app.restore_screen.log.mapping("game3");
+        app.restore_screen.log.set_comment("game3", "pending".into());
+        app.save_edited_backup("game3", before);
+        let _ = app.handle_backup(BackupPhase::Start {
+            preview: false,
+            repair: false,
+            jump: false,
+            games: Some(GameSelection::Single { game: "game3".into() }),
+        });
+        assert!(matches!(app.operation, Operation::Backup { .. }));
+        assert!(!app.operation.errors().unwrap().is_empty());
+        assert!(!app.operation.should_sync_cloud_after());
+    }
+
+    #[test]
+    fn cancelling_note_sync_discards_the_queued_backup() {
+        let (_temp, mut app, _file) = note_editor();
+        queued_note_backup(&mut app);
+        let _ = app.cancel_operation();
+        let _ = app.update(Message::EditedMetadataSynced(vec![("game3".into(), Ok(()))]));
+        assert!(app.operation.idle());
+        assert!(app.after_metadata_sync.is_none());
+        assert!(!app.metadata_sync_active);
+        assert!(!app.metadata_sync_requested);
+    }
+
+    #[test]
+    fn edits_during_upload_remain_pending_with_the_uploaded_cloud_baseline() {
+        let (_temp, mut app, file) = note_editor();
+        app.config.cloud.synchronize = true;
+        let before = app.restore_screen.log.mapping("game3");
+        app.restore_screen.log.set_comment("game3", "uploaded note".into());
+        app.save_edited_backup("game3", before);
+        let uploaded = app.restore_screen.log.mapping("game3").unwrap().1;
+        app.edited_metadata.get_mut("game3").unwrap().after = uploaded.clone();
+        app.operation = Operation::new_cloud(SyncDirection::Upload, Finality::Final);
+        app.metadata_sync_active = true;
+        let before = app.restore_screen.log.mapping("game3");
+        app.restore_screen.log.set_comment("game3", "newer note".into());
+        app.save_edited_backup("game3", before);
+        let _ = app.update(Message::EditedMetadataSynced(vec![("game3".into(), Ok(()))]));
+        assert_eq!(app.edited_metadata["game3"].before, uploaded);
+        assert!(app.metadata_sync_requested);
+        assert!(file.try_read().unwrap().contains("newer note"));
     }
 }

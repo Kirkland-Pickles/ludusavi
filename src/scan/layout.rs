@@ -580,6 +580,10 @@ impl GameLayout {
         self.mapping.save(&Self::mapping_file(&self.path))
     }
 
+    pub fn mapping_content(&self) -> String {
+        self.mapping.serialize()
+    }
+
     pub fn verify_id(&self, id: &BackupId) -> BackupId {
         match id {
             BackupId::Latest => id.clone(),

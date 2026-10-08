@@ -110,6 +110,8 @@ pub enum Message {
         user: bool,
     },
     Save,
+    SyncEditedMetadata,
+    EditedMetadataSynced(Vec<(String, Result<(), Error>)>),
     CloseModal,
     UpdateTime,
     PruneNotifications,

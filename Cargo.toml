@@ -28,6 +28,7 @@ app = [
 ]
 
 [dependencies]
+tempfile = "3.14.0"
 base64 = "0.22.1"
 byte-unit = "5.1.4"
 chrono = { version = "0.4.38", features = ["serde"] }
@@ -83,7 +84,6 @@ embed-resource = "3.0.6"
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
-tempfile = "3.14.0"
 velcro = "0.5.4"
 
 [profile.dev]

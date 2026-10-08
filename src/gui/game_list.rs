@@ -23,6 +23,7 @@ use crate::{
         },
     },
     lang::TRANSLATOR,
+    prelude::StrictPath,
     resource::{
         cache::Cache,
         config::{self, Config, Sort},
@@ -864,6 +865,9 @@ impl GameList {
             return false;
         };
 
+        if backup.comment().map(String::as_str).unwrap_or_default() == comment {
+            return false;
+        }
         layout.set_backup_comment(&backup.id(), &comment);
         backup.set_comment(comment);
 
@@ -881,6 +885,9 @@ impl GameList {
         editor.perform(action);
         let comment = editor.text().trim().to_string();
 
+        if backup.comment().map(String::as_str).unwrap_or_default() == comment {
+            return None;
+        }
         layout.set_backup_comment(&backup.id(), &comment);
         backup.set_comment(comment.clone());
 
@@ -913,6 +920,12 @@ impl GameList {
         let Some(layout) = &mut entry.game_layout else { return };
 
         layout.save();
+    }
+
+    pub fn mapping(&self, game: &str) -> Option<(StrictPath, String)> {
+        let entry = &self.entries[self.find_game(game)?];
+        let layout = entry.game_layout.as_ref()?;
+        Some((layout.path.joined("mapping.yaml"), layout.mapping_content()))
     }
 
     fn manifests(&self, manifest: &Manifest) -> Vec<game_filter::Manifest> {
