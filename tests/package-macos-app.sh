@@ -6,8 +6,7 @@ temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 
 fixture_binary="$temp_dir/ludusavi"
-printf '#!/usr/bin/env bash\nprintf "fixture\\n"\n' > "$fixture_binary"
-chmod +x "$fixture_binary"
+printf 'int main(void) { return 0; }\n' | clang -x c -o "$fixture_binary" -
 
 staging_dir="$temp_dir/staging"
 archive="$temp_dir/ludusavi-v1.2.3-mac.tar.gz"
@@ -19,6 +18,7 @@ plist="$app/Contents/Info.plist"
 
 test -x "$app/Contents/MacOS/Ludusavi"
 test -f "$app/Contents/Resources/Ludusavi.icns"
+codesign --verify --deep --strict "$app"
 test -L "$staging_dir/ludusavi"
 test "$(readlink "$staging_dir/ludusavi")" = "Ludusavi.app/Contents/MacOS/Ludusavi"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")" = "Ludusavi"

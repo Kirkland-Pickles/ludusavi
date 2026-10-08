@@ -53,4 +53,11 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+if [[ -n "${LUDUSAVI_MACOS_SIGNING_IDENTITY:-}" ]]; then
+    codesign --force --options runtime --timestamp --sign "$LUDUSAVI_MACOS_SIGNING_IDENTITY" "$app"
+else
+    codesign --force --sign - "$app"
+fi
+codesign --verify --deep --strict "$app"
+
 tar --create --gzip --file="$archive" --directory="$staging_dir" Ludusavi.app ludusavi
