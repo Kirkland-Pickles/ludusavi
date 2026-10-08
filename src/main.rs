@@ -231,10 +231,16 @@ fn main() {
             let flags = Flags {
                 update_manifest: !args.no_manifest_update,
                 custom_game: None,
+                ..Default::default()
             };
             gui::run(flags);
         }
-        Some(cli::parse::Subcommand::Gui { custom_game }) => {
+        Some(cli::parse::Subcommand::Gui {
+            custom_game,
+            background,
+            watch,
+            backup_delay,
+        }) => {
             #[cfg(target_os = "windows")]
             if std::env::var(crate::prelude::ENV_DEBUG).is_err() {
                 unsafe {
@@ -245,6 +251,9 @@ fn main() {
             let flags = Flags {
                 update_manifest: !args.no_manifest_update,
                 custom_game,
+                background,
+                watches: watch,
+                backup_delay,
             };
             gui::run(flags);
         }

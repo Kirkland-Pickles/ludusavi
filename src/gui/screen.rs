@@ -333,6 +333,12 @@ pub fn other<'a>(
                 .padding(padding::top(0).bottom(5).left(15).right(15))
                 .width(Length::Fill)
                 .push(
+                    Button::new(text("Automatic backups…"))
+                        .padding(5)
+                        .class(style::Button::Primary)
+                        .on_press(Message::OpenBackgroundSettings),
+                )
+                .push(
                     Row::new()
                         .align_y(iced::Alignment::Center)
                         .spacing(20)

@@ -33,6 +33,9 @@ pub const ERROR_ICON: text_input::Icon<iced::Font> = text_input::Icon {
 pub struct Flags {
     pub update_manifest: bool,
     pub custom_game: Option<String>,
+    pub background: bool,
+    pub watches: Vec<String>,
+    pub backup_delay: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +109,15 @@ pub enum ValidatePhase {
 #[derive(Debug, Clone)]
 pub enum Message {
     Ignore,
+    WindowOpened(iced::window::Id),
+    CloseWindow(iced::window::Id),
+    BackgroundTick,
+    BackgroundPolled(
+        u64,
+        Result<(super::background::Config, std::collections::HashSet<String>), String>,
+    ),
+    BackgroundEdit(super::background::Edit),
+    OpenBackgroundSettings,
     Exit {
         user: bool,
     },
@@ -697,6 +709,7 @@ pub enum BrowseSubject {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowseFileSubject {
+    BackgroundExecutable(String),
     RcloneExecutable,
     RootLutrisDatabase(usize),
     SecondaryManifest(usize),

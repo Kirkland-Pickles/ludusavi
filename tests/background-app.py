@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Exercise background backups with temporary configuration and a test process."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import tempfile
+import time
+
+
+def wait_for(check, timeout=30, description="background backup"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"Timed out waiting for {description}")
+
+
+def wait_for_owner(app, configuration):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        client.settimeout(0.2)
+
+        def ready():
+            assert app.poll() is None, f"Background app exited during startup: {app.returncode}"
+            try:
+                endpoint = (configuration / "background.port").read_text(encoding="utf-8").splitlines()
+                if len(endpoint) != 2 or int(endpoint[1]) != app.pid:
+                    return False
+                address = ("127.0.0.1", int(endpoint[0]))
+                client.sendto(b"ludusavi:open:null", address)
+                reply, sender = client.recvfrom(32)
+                return sender == address and reply == b"ludusavi:opened"
+            except (OSError, ValueError, OverflowError):
+                return False
+
+        wait_for(ready, description="the background app's reopen handshake")
+
+
+def visible_windows(process):
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user.EnumWindows.argtypes = [callback, wintypes.LPARAM]
+    user.IsWindowVisible.argtypes = [wintypes.HWND]
+    user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    windows = []
+    @callback
+    def visit(window, _):
+        owner = wintypes.DWORD()
+        user.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        kind = ctypes.create_unicode_buffer(128)
+        user.GetClassNameW(window, kind, len(kind))
+        if owner.value == process and kind.value == "Window Class" and user.IsWindowVisible(window):
+            windows.append(window)
+        return True
+    assert user.EnumWindows(visit, 0), "Unable to inspect the test app's windows"
+    return windows
+
+
+def reopen_legacy(binary, command, options):
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+    user.GetForegroundWindow.restype = wintypes.HWND
+    user.IsIconic.argtypes = [wintypes.HWND]
+    configuration = Path(command[2])
+    installation = configuration.parent / "installation"
+    installation.mkdir()
+    installed = installation / "ludusavi.exe"
+    shutil.copyfile(binary, installed)
+    environment = {**os.environ, "RUST_LOG": "ludusavi=info"}
+    app = subprocess.Popen([str(installed), *command[1:], "gui"], env=environment, **options)
+    try:
+        wait_for(lambda: visible_windows(app.pid))
+        time.sleep(1)
+        assert not (configuration / "background.port").exists(), "Legacy test requires a build without handoff"
+        installed.rename(installation / "previous.exe")
+        shutil.copyfile(command[0], installed)
+        for minimized in [False, True]:
+            window = visible_windows(app.pid)[0]
+            if minimized:
+                user.ShowWindowAsync(window, 6)
+                wait_for(lambda: user.IsIconic(window))
+            else:
+                assert user.PostMessageW(window, 0x0010, 0, 0), "Unable to close the legacy test window"
+                wait_for(lambda: not visible_windows(app.pid))
+            assert subprocess.run([str(installed), *command[1:]], timeout=8, env=environment, **options).returncode == 0, \
+                "Second launch failed to reopen the legacy app"
+            assert app.poll() is None, "Second launch stopped the legacy app"
+            wait_for(lambda: visible_windows(app.pid))
+            wait_for(lambda: not user.IsIconic(window))
+            wait_for(lambda: any("Reopened Ludusavi without an instance socket:" in path.read_text(encoding="utf-8", errors="replace")
+                                 for path in configuration.glob("*.log")))
+        print("Older tray build reopens from hidden and minimized states without a popup")
+    finally:
+        if app.poll() is None:
+            app.terminate()
+            app.wait(timeout=10)
+
+
+def run(binary, game, normal_launch=False, legacy_binary=None):
+    with tempfile.TemporaryDirectory(prefix="ludusavi-background-test-") as temporary:
+        root = Path(temporary)
+        configuration = root / "config"
+        configuration.mkdir()
+        command = [str(binary), "--config", str(configuration), "--no-manifest-update"]
+        config = json.loads(subprocess.check_output(command + ["config", "show", "--api"], text=True))
+        known_roots = config["roots"]
+        save = root / "save.txt"
+        save.write_text("first save", encoding="utf-8")
+        config.update({
+            "roots": [], "release": {"check": False},
+            "backup": {"path": str(root / "backups")},
+            "restore": {"path": str(root / "backups")},
+            "cloud": {"synchronize": False},
+            "customGames": [{"name": "Background Test", "files": [str(save)]}],
+        })
+        (configuration / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+        (configuration / "cache.yaml").write_text(json.dumps({"roots": known_roots}), encoding="utf-8")
+        (configuration / "manifest.yaml").write_text("{}", encoding="utf-8")
+        background = {"enabled": True, "pollSeconds": 1, "delaySeconds": 2, "games": [
+            {"name": "Background Test", "executables": [str(game)], "enabled": True}
+        ]}
+        (configuration / "background.yaml").write_text(json.dumps(background), encoding="utf-8")
+        options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        if legacy_binary:
+            reopen_legacy(legacy_binary, command, options)
+        app = subprocess.Popen(command + (["gui"] if normal_launch else ["gui", "--background"]),
+                               env={**os.environ, "RUST_LOG": "ludusavi=info"}, **options)
+        def notification_count(text="Windows backup notification submitted for Background Test"):
+            return sum(path.read_text(encoding="utf-8", errors="replace").count(text)
+                       for path in configuration.glob("*.log"))
+        children = []
+        try:
+            wait_for_owner(app, configuration)
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes
+                user = ctypes.WinDLL("user32", use_last_error=True)
+                user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+                windows = visible_windows(app.pid)
+                if normal_launch:
+                    assert windows, "The test app's main window did not open"
+                for window in windows:
+                    assert user.PostMessageW(window, 0x0010, 0, 0), "Unable to close the test window"
+                wait_for(lambda: not visible_windows(app.pid))
+            for arguments in [[], ["gui"], ["gui", "--custom-game", "Reopen Test"], ["gui", "--custom-game", "Reopen Test"]]:
+                reopened = subprocess.run(command + arguments, timeout=8, **options)
+                assert reopened.returncode == 0, "Second launch failed"
+                assert app.poll() is None, "Second launch stopped the running app"
+                if os.name == "nt":
+                    wait_for(lambda: visible_windows(app.pid))
+            wait_for(lambda: notification_count("Reopening Ludusavi after another launch") >= 5)
+            def custom_game_count():
+                current = json.loads(subprocess.check_output(command + ["config", "show", "--api"], text=True))
+                return sum(game["name"] == "Reopen Test" for game in current["customGames"])
+            wait_for(lambda: custom_game_count() == 1)
+            print("Second launches reopen the owner; custom-game requests do not duplicate games")
+            assert not list((root / "backups").glob("*/mapping.yaml")), "Backed up without an observed game exit"
+            first = subprocess.Popen([str(game)], **options)
+            children.append(first)
+            time.sleep(1)
+            second = subprocess.Popen([str(game)], **options)
+            children.append(second)
+            time.sleep(2)
+            first.terminate()
+            first.wait(timeout=5)
+            time.sleep(3)
+            assert not list((root / "backups").glob("*/mapping.yaml")), "Backed up while another game process was running"
+            if os.name == "nt":
+                assert notification_count() == 0, "Notified before the game closed and the delay elapsed"
+            second.terminate()
+            second.wait(timeout=5)
+            wait_for(lambda: bool(list((root / "backups").glob("*/mapping.yaml"))))
+            if os.name == "nt":
+                wait_for(lambda: notification_count() == 1)
+                wait_for(lambda: notification_count("Windows backup result notification submitted: Automatic backup complete") == 1)
+            # Restore with the ordinary CLI to verify the automatic backup's data.
+            save.write_text("changed after backup", encoding="utf-8")
+            subprocess.run(command + ["restore", "--force", "Background Test"], check=True, capture_output=True)
+            assert save.read_text(encoding="utf-8") == "first save"
+            # Editing background.yaml takes effect without restarting the app.
+            background["games"][0]["enabled"] = False
+            (configuration / "background.yaml").write_text(json.dumps(background), encoding="utf-8")
+            time.sleep(2)
+            save.write_text("must not be backed up", encoding="utf-8")
+            third = subprocess.Popen([str(game)], **options)
+            children.append(third)
+            time.sleep(2)
+            third.terminate()
+            third.wait(timeout=5)
+            time.sleep(4)
+            subprocess.run(command + ["restore", "--force", "Background Test"], check=True, capture_output=True)
+            assert save.read_text(encoding="utf-8") == "first save"
+            background["games"][0]["enabled"] = True
+            background["enabled"] = False
+            (configuration / "background.yaml").write_text(json.dumps(background), encoding="utf-8")
+            time.sleep(2)
+            save.write_text("globally disabled", encoding="utf-8")
+            fourth = subprocess.Popen([str(game)], **options)
+            children.append(fourth)
+            time.sleep(2)
+            save.write_text("globally disabled", encoding="utf-8")
+            fourth.terminate()
+            fourth.wait(timeout=5)
+            time.sleep(4)
+            subprocess.run(command + ["restore", "--force", "Background Test"], check=True, capture_output=True)
+            assert save.read_text(encoding="utf-8") == "first save"
+            assert app.poll() is None, "Background app stopped after its backup"
+            if os.name == "nt":
+                assert notification_count() == 1, "Disabled games must not send backup notifications"
+                assert notification_count("Windows backup result notification submitted:") == 1
+            # Restart the isolated app with the unchanged save, then with an invalid backup target.
+            for expected, invalid_target in [("No backup needed", False), ("Automatic backup failed", True)]:
+                app.terminate()
+                app.wait(timeout=10)
+                background["enabled"] = True
+                (configuration / "background.yaml").write_text(json.dumps(background), encoding="utf-8")
+                if invalid_target:
+                    target = root / "a-file-not-a-folder"
+                    target.write_text("leave this file alone", encoding="utf-8")
+                    config["backup"]["path"] = str(target)
+                    (configuration / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+                app = subprocess.Popen(command + ["gui"],
+                                       env={**os.environ, "RUST_LOG": "ludusavi=info"}, **options)
+                wait_for_owner(app, configuration)
+                child = subprocess.Popen([str(game)], **options)
+                children.append(child)
+                time.sleep(2)
+                child.terminate()
+                child.wait(timeout=5)
+                if os.name == "nt":
+                    wait_for(lambda: notification_count("Windows backup result notification submitted: " + expected) == 1)
+                else:
+                    wait_for(lambda: notification_count(expected + ": Background Test") == 1)
+                if invalid_target:
+                    assert target.read_text(encoding="utf-8") == "leave this file alone"
+                assert save.read_text(encoding="utf-8") == "first save"
+            print("Backup, restore, disabled games, and success/unchanged/failure notification checks passed")
+        except Exception:
+            print(f"Background owner exit status: {app.poll()}", flush=True)
+            for log in sorted(configuration.glob("*.log")):
+                print(f"--- {log.name} ---", flush=True)
+                print("\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]), flush=True)
+            raise
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+                    child.wait(timeout=5)
+            if app.poll() is None:
+                app.terminate()
+                app.wait(timeout=10)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("game", type=Path, help="A harmless test executable that stays running until terminated")
+    parser.add_argument("--normal-launch", action="store_true")
+    parser.add_argument("--legacy-binary", type=Path, help="Older Windows tray build without instance handoff")
+    args = parser.parse_args()
+    run(args.binary.resolve(strict=True), args.game.resolve(strict=True), args.normal_launch,
+        args.legacy_binary.resolve(strict=True) if args.legacy_binary else None)

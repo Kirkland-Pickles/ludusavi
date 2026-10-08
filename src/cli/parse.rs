@@ -561,6 +561,15 @@ pub enum Subcommand {
         /// or scroll to an existing entry.
         #[clap(long)]
         custom_game: Option<String>,
+        /// Keep running in the tray and back up configured games after they close.
+        #[clap(long)]
+        background: bool,
+        /// Add a game and its absolute executable path to background.yaml. Repeat for multiple games or executables.
+        #[clap(long, value_name = "GAME=EXECUTABLE", requires = "background")]
+        watch: Vec<String>,
+        /// Seconds to wait after the last game process closes before backing up.
+        #[clap(long, value_name = "SECONDS", requires = "background")]
+        backup_delay: Option<u64>,
     },
 }
 
@@ -1543,7 +1552,12 @@ mod tests {
                 no_manifest_update: false,
                 try_manifest_update: false,
                 debug: false,
-                sub: Some(Subcommand::Gui { custom_game: None }),
+                sub: Some(Subcommand::Gui {
+                    custom_game: None,
+                    background: false,
+                    watch: vec![],
+                    backup_delay: None,
+                }),
             },
         );
     }
@@ -1559,8 +1573,29 @@ mod tests {
                 debug: false,
                 sub: Some(Subcommand::Gui {
                     custom_game: Some("foo".to_string()),
+                    background: false,
+                    watch: vec![],
+                    backup_delay: None,
                 }),
             },
         );
+    }
+
+    #[test]
+    fn accepts_background_watch_and_delay() {
+        let cli = Cli::try_parse_from([
+            "ludusavi",
+            "gui",
+            "--background",
+            "--watch",
+            "Game=C:/Games/game.exe",
+            "--backup-delay",
+            "7",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.sub, Some(Subcommand::Gui { background: true, watch, backup_delay: Some(7), .. }) if watch == vec!["Game=C:/Games/game.exe"])
+        );
+        assert!(Cli::try_parse_from(["ludusavi", "gui", "--watch", "Game=C:/Games/game.exe"]).is_err());
     }
 }
