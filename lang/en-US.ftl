@@ -205,6 +205,7 @@ compression-zstd = Zstd
 theme = Theme
 theme-light = Light
 theme-dark = Dark
+theme-auto = Auto (follow system)
 
 redirect-bidirectional = Bidirectional
 reverse-redirects-when-restoring = Reverse sequence of redirects when restoring

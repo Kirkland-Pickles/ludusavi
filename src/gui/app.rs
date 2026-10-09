@@ -1972,8 +1972,8 @@ impl App {
         }
     }
 
-    pub fn theme(&self, _window: iced::window::Id) -> crate::gui::style::Theme {
-        crate::gui::style::Theme::from(self.config.theme)
+    pub fn theme(&self, _window: iced::window::Id) -> Option<crate::gui::style::Theme> {
+        (self.config.theme != config::Theme::Auto).then(|| crate::gui::style::Theme::from(self.config.theme))
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -4074,6 +4074,21 @@ mod tests {
         assert!(!app.exiting);
     }
 
+    #[test]
+    fn auto_theme_uses_system_preference_and_manual_modes_override_it() {
+        use iced::theme::Base;
+        let mut app = App::default();
+        let window = iced::window::Id::unique();
+        assert!(app.theme(window).is_none());
+        for (setting, mode) in [
+            (config::Theme::Light, iced::theme::Mode::Light),
+            (config::Theme::Dark, iced::theme::Mode::Dark),
+        ] {
+            app.config.theme = setting;
+            assert_eq!(app.theme(window).unwrap().mode(), mode);
+            assert_eq!(<style::Theme as Base>::default(mode).mode(), mode);
+        }
+    }
     #[test]
     fn missing_restore_folder_search_offers_a_popup_and_fills_only_after_acceptance() {
         let temp = tempfile::tempdir().unwrap();

@@ -328,12 +328,13 @@ impl Default for SecondaryManifestConfig {
 #[serde(rename_all = "camelCase")]
 pub enum Theme {
     #[default]
+    Auto,
     Light,
     Dark,
 }
 
 impl Theme {
-    pub const ALL: &'static [Self] = &[Self::Light, Self::Dark];
+    pub const ALL: &'static [Self] = &[Self::Auto, Self::Light, Self::Dark];
 }
 
 impl ToString for Theme {
@@ -2122,7 +2123,7 @@ mod tests {
                     secondary: vec![]
                 },
                 language: Language::English,
-                theme: Theme::Light,
+                theme: Theme::Auto,
                 roots: vec![],
                 redirects: vec![],
                 backup: BackupConfig {
@@ -2246,7 +2247,7 @@ mod tests {
                     }]
                 },
                 language: Language::English,
-                theme: Theme::Light,
+                theme: Theme::Auto,
                 roots: vec![Root::new("~/steam", Store::Steam), Root::new("~/other", Store::Other),],
                 redirects: vec![RedirectConfig {
                     kind: RedirectKind::Restore,

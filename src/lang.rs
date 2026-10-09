@@ -1051,6 +1051,7 @@ impl Translator {
 
     pub fn theme_name(&self, theme: &Theme) -> String {
         translate(match theme {
+            Theme::Auto => "theme-auto",
             Theme::Light => "theme-light",
             Theme::Dark => "theme-dark",
         })

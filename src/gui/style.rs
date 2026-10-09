@@ -50,6 +50,7 @@ impl Default for Theme {
 impl From<config::Theme> for Theme {
     fn from(source: config::Theme) -> Self {
         match source {
+            config::Theme::Auto => Self::default(),
             config::Theme::Light => Self {
                 source,
                 background: Color::WHITE,
@@ -81,12 +82,17 @@ impl From<config::Theme> for Theme {
 }
 
 impl iced::theme::Base for Theme {
-    fn default(_preference: iced::theme::Mode) -> Self {
-        <Theme as Default>::default()
+    fn default(preference: iced::theme::Mode) -> Self {
+        Self::from(if preference == iced::theme::Mode::Dark {
+            config::Theme::Dark
+        } else {
+            config::Theme::Light
+        })
     }
 
     fn mode(&self) -> iced::theme::Mode {
         match self.source {
+            config::Theme::Auto => iced::theme::Mode::None,
             config::Theme::Light => iced::theme::Mode::Light,
             config::Theme::Dark => iced::theme::Mode::Dark,
         }
@@ -105,6 +111,7 @@ impl iced::theme::Base for Theme {
 
     fn name(&self) -> &str {
         match self.source {
+            config::Theme::Auto => "auto",
             config::Theme::Light => "light",
             config::Theme::Dark => "dark",
         }

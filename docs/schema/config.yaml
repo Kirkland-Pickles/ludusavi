@@ -111,7 +111,7 @@ properties:
     allOf:
       - $ref: "#/definitions/Scan"
   theme:
-    default: light
+    default: auto
     allOf:
       - $ref: "#/definitions/Theme"
 definitions:
@@ -924,6 +924,7 @@ definitions:
     description: Visual theme.
     type: string
     enum:
+      - auto
       - light
       - dark
   ToggledPaths:
