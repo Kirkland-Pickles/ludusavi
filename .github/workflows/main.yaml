@@ -138,6 +138,8 @@ jobs:
       - run: cargo build --locked
       - if: ${{ matrix.os == 'windows-latest' }}
         run: python tests/background-app.py target/debug/ludusavi.exe "$env:LUDUSAVI_TEST_GAME" --normal-launch
+      - if: ${{ matrix.os == 'windows-latest' }}
+        run: python tests/windows-launch.py target/debug/ludusavi.exe
       - if: ${{ matrix.os == 'ubuntu-latest' }}
         run: xvfb-run -a dbus-run-session -- python tests/background-app.py target/debug/ludusavi "$LUDUSAVI_TEST_GAME"
       - if: ${{ startsWith(matrix.os, 'macos-') }}

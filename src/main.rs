@@ -102,50 +102,10 @@ fn prepare_winit() {
     }
 }
 
-/// Detach the current process from its console on Windows.
-///
-/// ## Testing
-/// This has several edge cases and has been the source of multiple bugs.
-/// If you change this, be careful and make sure to test this matrix:
-///
-/// * Arguments:
-///   * None (double click in Windows Explorer)
-///   * None (from console)
-///   * `--help` (has output, but before this function is called)
-///   * `backup --preview` (has output, after this function is called)
-/// * Consoles:
-///   * Command Prompt
-///   * PowerShell
-///   * Git Bash
-/// * Console host for double clicking in Windows Explorer:
-///   * Windows Console Host
-///   * Windows Terminal
-///
-/// ## Alternatives
-/// We have tried `#![windows_subsystem = "windows"]` plus `AttachConsole`/`AllocConsole`,
-/// but that messes up the console output in Command Prompt and PowerShell
-/// (a new prompt line is shown, and then the output bleeds into that line).
-///
-/// We have tried relaunching the program with a special environment variable,
-/// but that eventually raised a false positive from Windows Defender (`Win32/Wacapew.C!ml`).
-///
-/// We may eventually want to try using a manifest to set `<consoleAllocationPolicy>`,
-/// but that is not yet widely available:
-/// https://github.com/microsoft/terminal/blob/5383cb3a1bb8095e214f7d4da085ea4646db8868/doc/specs/%237335%20-%20Console%20Allocation%20Policy.md
-///
-/// ## Considerations
-/// The current approach is to let the console appear and then immediately `FreeConsole`.
-/// Previously, Windows Terminal wouldn't remove the console in that case,
-/// but that has been fixed: https://github.com/microsoft/terminal/issues/16174
-///
-/// There was also an issue where asynchronous Rclone commands would fail to spawn
-/// ("The request is not supported (os error 50)"),
-/// but that has been solved by resetting the standard device handles:
-/// https://github.com/rust-lang/rust/issues/113277
-///
-/// Watch out for non-obvious code paths that may defeat detachment.
-/// flexi_logger's `colors` feature would cause the console to stick around
-/// if logging was enabled before detaching.
+/// Detach GUI launches from the console without changing CLI output or shell waiting.
+/// The manifest prevents console allocation on Windows 11 24H2+; older Windows can briefly show it.
+/// Reset the standard handles after detaching so Rclone subprocesses can start.
+/// https://learn.microsoft.com/en-us/windows/console/console-allocation-policy
 #[cfg(target_os = "windows")]
 unsafe fn detach_console(debug: bool) {
     unsafe {
