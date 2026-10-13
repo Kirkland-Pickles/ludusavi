@@ -1,3 +1,10 @@
+> This fork adds:
+>
+> * Automatic backups after a game closes.
+> * Platform installers instead of portable-only.
+> * Auto-save and cloud sync after writing backup notes.
+
+
 # ![Logo](assets/icon.svg) Ludusavi
 Ludusavi is a tool for backing up your PC video game save data,
 written in [Rust](https://www.rust-lang.org).
