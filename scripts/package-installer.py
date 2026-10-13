@@ -35,7 +35,7 @@ def linux_root(binary: Path, root: Path, version: str) -> None:
     control.write_text(
         f"Package: ludusavi\nVersion: {version}\nArchitecture: amd64\n"
         "Maintainer: Ludusavi fork maintainers\nSection: games\nPriority: optional\n"
-        "Depends: libc6 (>= 2.35), libgtk-3-0, libxcb-composite0\n"
+        "Depends: libc6 (>= 2.35), libgtk-3-0, libxcb-composite0, libxkbcommon0, libxkbcommon-x11-0\n"
         "Description: Back up and restore PC game saves\n"
         " Can back up saves automatically after a game closes.\n",
         encoding="utf-8",
